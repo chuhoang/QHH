@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Quản lý lớp học, camera và giám sát AI QHH">
+  <title>QHH Classroom</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css?v=20260625.8">
+</head>
+<body>
+  <a class="skip-link" href="#content">Đi tới nội dung</a>
+  <main id="content" class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="QHH Classroom">
+        <span class="brand-mark">Q</span>
+        <span>QHH Classroom</span>
+      </a>
+      <nav class="main-nav" aria-label="Điều hướng chính">
+        <button class="nav-item active" data-view="monitor">Giám sát</button>
+        <button class="nav-item" data-view="classes">Lớp học</button>
+        <button class="nav-item" data-view="cameras">Camera</button>
+        <button class="nav-item" data-view="people">Người học</button>
+      </nav>
+      <div class="connection">
+        <span id="redisDot" class="dot"></span>
+        <span id="redisText">Đang kiểm tra Redis</span>
+      </div>
+    </header>
+
+    <section id="monitorView" class="app-view active">
+      <section class="control-rail">
+        <label>
+          <span>Lớp học</span>
+          <select id="classSelect"></select>
+        </label>
+        <label>
+          <span>Camera</span>
+          <select id="cameraSelect"></select>
+        </label>
+        <label>
+          <span>Điểm xét vùng</span>
+          <select id="modeSelect">
+            <option value="centerpoint">Tâm + ít nhất 35% trong vùng</option>
+            <option value="perspective">Điểm chân perspective</option>
+          </select>
+        </label>
+        <div class="rail-actions">
+          <button id="aiToggle" class="button primary">Bật AI</button>
+          <button id="viewToggle" class="button secondary">Khung AI đồng bộ</button>
+        </div>
+      </section>
+
+      <section class="monitor-grid">
+        <article class="stage">
+          <div class="stage-head">
+            <div>
+              <p id="eyebrow">Live từ video record</p>
+              <h1 id="cameraTitle">Đang tải camera</h1>
+            </div>
+            <div class="stage-meta">
+              <span id="viewMode">LIVE 25 FPS</span>
+              <span id="latency">AI chưa chạy</span>
+            </div>
+          </div>
+          <div id="viewport" class="viewport">
+            <img id="stream" alt="Luồng camera lớp học">
+            <canvas id="overlay"></canvas>
+            <div id="emptyStream" class="empty-state">Đang chờ video record</div>
+          </div>
+          <div class="stage-foot">
+            <span id="aiStatus">AI chưa chạy</span>
+            <span id="lastUpdate">Chưa có kết quả</span>
+          </div>
+        </article>
+
+        <aside class="status-panel">
+          <div class="panel-head">
+            <div>
+              <p>Tình trạng chỗ ngồi</p>
+              <h2 id="summaryTitle">Chưa có dữ liệu</h2>
+            </div>
+            <button id="refreshButton" class="icon-button" title="Làm mới">↻</button>
+          </div>
+          <div id="deskList" class="desk-list"></div>
+        </aside>
+
+        <section class="mapping-panel">
+          <div class="mapping-copy">
+            <p>Mapping vùng camera</p>
+            <h2>Khoanh toàn bộ khu vực của một bàn</h2>
+            <span>Kéo trực tiếp trên video; tọa độ được lưu theo cặp camera–lớp.</span>
+          </div>
+          <label>
+            <span>Bàn</span>
+            <select id="deskSelect"></select>
+          </label>
+          <div class="mapping-actions">
+            <button id="drawButton" class="button secondary">Vẽ vùng</button>
+            <button id="saveButton" class="button primary" disabled>Lưu vùng</button>
+            <button id="cancelButton" class="button ghost">Hủy</button>
+            <button id="deleteButton" class="button danger">Xóa vùng</button>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <section id="classesView" class="app-view management-view">
+      <header class="view-head">
+        <div><p>Cấu trúc giảng dạy</p><h1>Lớp học</h1><span>Tạo lớp, quy định số bàn và mở nhanh màn giám sát.</span></div>
+        <button class="button primary" data-action="new-class">Thêm lớp</button>
+      </header>
+      <div id="classGrid" class="entity-grid"></div>
+    </section>
+
+    <section id="camerasView" class="app-view management-view">
+      <header class="view-head">
+        <div><p>Nguồn hình ảnh</p><h1>Camera</h1><span>Kết nối thiết bị và gắn một camera với nhiều lớp.</span></div>
+        <button class="button primary" data-action="new-camera">Thêm camera</button>
+      </header>
+      <div id="cameraGrid" class="entity-grid camera-grid"></div>
+    </section>
+
+    <section id="peopleView" class="app-view management-view">
+      <header class="view-head">
+        <div><p>Danh sách nhận diện</p><h1>Người học</h1><span>Thêm người học, chọn lớp và xếp vị trí bàn/chỗ.</span></div>
+        <button class="button primary" data-action="new-person">Thêm người</button>
+      </header>
+      <div class="people-toolbar">
+        <label><span>Lọc theo lớp</span><select id="peopleClassFilter"></select></label>
+        <label><span>Tìm kiếm</span><input id="peopleSearch" type="search" placeholder="Tên hoặc mã người học"></label>
+      </div>
+      <div id="peopleList" class="people-list"></div>
+    </section>
+  </main>
+
+  <aside id="editorPanel" class="editor-panel" aria-hidden="true">
+    <div class="editor-backdrop" data-action="close-editor"></div>
+    <section class="editor-sheet" role="dialog" aria-modal="true" aria-labelledby="editorTitle">
+      <header>
+        <div><p id="editorEyebrow">Chỉnh sửa</p><h2 id="editorTitle">Thông tin</h2></div>
+        <button class="icon-button" data-action="close-editor" aria-label="Đóng">×</button>
+      </header>
+      <form id="editorForm" class="editor-form"></form>
+    </section>
+  </aside>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=20260625.8"></script>
+</body>
+</html>

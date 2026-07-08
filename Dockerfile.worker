@@ -1,0 +1,56 @@
+# Worker container — Celery worker + scheduler + web_server
+# Base: NVIDIA CUDA runtime (Tesla T4 supports CUDA 12.x). onnxruntime-gpu
+# 1.17+ uses CUDA 12.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# System deps:
+# - python3.11 + venv + pip + dev headers
+# - build-essential + python3.11-dev : compile `lap` (SORT tracker) from C source
+# - libgl1, libglib2.0 : OpenCV runtime
+# - ffmpeg : web test records RTSP segments before running AI
+# - libxkbcommon0, libegl1, libfontconfig1, libdbus-1-3 : PySide6 headless import
+# - tini : PID 1 signal handler so Celery workers get clean SIGTERM
+# - tzdata : zoneinfo cho TZ=Asia/Ho_Chi_Minh (datetime.now() phải ra giờ VN,
+#   nếu thiếu glibc fallback UTC → tên video lệch 7h → scheduler skip nhầm tiết).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev python3-pip \
+        build-essential \
+        libgl1 libglib2.0-0 \
+        ffmpeg \
+        libxkbcommon0 libegl1 libfontconfig1 libdbus-1-3 \
+        ca-certificates tini curl tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+WORKDIR /app
+
+# Install Python deps first for better layer caching.
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip \
+    # torch CUDA 12.4 — ship cuDNN 9. Both YOLO (Ultralytics) and
+    # onnxruntime-gpu use the same cuDNN 9 from this install.
+    && pip install --index-url https://download.pytorch.org/whl/cu124 \
+        torch torchvision \
+    && pip install -r requirements.txt \
+    && pip uninstall -y onnxruntime onnxruntime-gpu \
+    # onnxruntime-gpu 1.19.2 builds against cuDNN 9 and CUDA 12.x.
+    && pip install onnxruntime-gpu==1.19.2
+
+# Copy application code last so code changes don't bust the deps layer.
+COPY . /app
+
+# Qt offscreen — keeps PySide6 importable without a display.
+ENV QT_QPA_PLATFORM=offscreen
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Default command — overridden per-service in docker-compose.yml.
+CMD ["celery", "-A", "celery_app", "worker", "-Q", "clip", \
+     "-P", "solo", "-c", "1", "-n", "clip-worker@%h", "--loglevel=info"]

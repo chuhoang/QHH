@@ -1,0 +1,238 @@
+
+# Pipeline:
+#   videos/* → scheduler → Redis QHH (external 192.168.6.170:6377) → worker (Celery)
+#   onnxruntime container is OPTIONAL — only needed if you later switch part of
+#   the inference to HTTP. The main pipeline runs ONNX in-process inside `worker`.
+
+x-app: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile.worker
+  image: qhh-ai-worker:latest
+  environment:
+    # Connect to the external QHH Redis (already running on 192.168.6.170:6377).
+    # Single source of truth — worker/web/beat/api đều trỏ CÙNG một Redis.
+    # Override per-deployment via .env if needed.
+    REDIS_HOST: ${REDIS_HOST:-192.168.6.170}
+    REDIS_PORT: ${REDIS_PORT:-6377}
+    REDIS_DB: ${REDIS_DB:-0}
+    REDIS_PASSWORD: ${REDIS_PASSWORD:-qhh_redis_change_me}
+    # Optional onnxruntime-server endpoint (in-process ONNX is the default).
+    ONNXRUNTIME_URL: http://onnxruntime:8001
+    # Múi giờ VN — datetime.now() (đặt tên record, log, cleanup) phải theo giờ VN.
+    # Container mặc định UTC → tên video lệch 7h → scheduler skip nhầm tiết học.
+    TZ: ${TZ:-Asia/Ho_Chi_Minh}
+    # Qt headless so PySide6 imports cleanly inside containers.
+    QT_QPA_PLATFORM: offscreen
+    # Test toàn ảnh: bỏ qua region khoanh, zone = toàn frame.
+    CLIP_ZONE_FULL_FRAME: "1"
+    # Centerpoint chỉ cần center bbox trong zone (tắt overlap check).
+    CENTERPOINT_MIN_OVERLAP: "0"
+    # Ingest API — bắn classroom-snapshot sau mỗi video xử lý xong.
+    SNAPSHOT_INGEST_URL: ${SNAPSHOT_INGEST_URL:-http://192.168.6.145:8088/api/events}
+    SNAPSHOT_INGEST_API_KEY: ${SNAPSHOT_INGEST_API_KEY:-qhh_ai_ingest_change_me}
+    # Base URL để client fetch ảnh snapshot: http://{host}:8000/snapshots
+    DISTRACTION_SNAPSHOT_BASE_URL: ${DISTRACTION_SNAPSHOT_BASE_URL:-http://192.168.6.170:8000/snapshots}
+    # Web test: when Start AI is clicked, record this camera to video segments,
+    # then run the existing AI pipeline on those completed segments.
+    QHH_RECORD_DIR: ${QHH_RECORD_DIR:-/app/recordings}
+    QHH_WEB_RECORD_ON_AI: ${QHH_WEB_RECORD_ON_AI:-true}
+    QHH_WEB_RECORD_DURATION_SEC: ${QHH_WEB_RECORD_DURATION_SEC:-10}
+    QHH_WEB_RECORD_INTERVAL_SEC: ${QHH_WEB_RECORD_INTERVAL_SEC:-60}
+    QHH_AI_AUTO_START: ${QHH_AI_AUTO_START:-false}
+    QHH_AI_RESULT_VIDEO_ON: ${QHH_AI_RESULT_VIDEO_ON:-false}
+    QHH_AI_RESULT_DIR: ${QHH_AI_RESULT_DIR:-/app/result_test}
+    QHH_AI_DELETE_PROCESSED_VIDEO: ${QHH_AI_DELETE_PROCESSED_VIDEO:-true}
+    QHH_AI_SNAPSHOT_ON: ${QHH_AI_SNAPSHOT_ON:-true}
+    QHH_WEB_LIVE_PREVIEW_ON: ${QHH_WEB_LIVE_PREVIEW_ON:-false}
+  volumes:
+    - ./videos:/app/videos
+    # Web test recordings: {cameraId}/{YYYYMMDD}/{YYYYMMDD_HHMMSS}_*.mkv
+    - ./recordings:/app/recordings
+    # Keep annotated AI result videos on the host after source records are deleted.
+    - ./result_test:/app/result_test
+    # SORT tracker — clip_inference import sort/sort.py
+    - ./sort:/app/sort:ro
+    # Source code mới cho worker + scheduler + tasks
+    - ./clip_inference.py:/app/clip_inference.py:ro
+    - ./tasks.py:/app/tasks.py:ro
+    - ./clip_queue.py:/app/clip_queue.py:ro
+    - ./video_scheduler.py:/app/video_scheduler.py:ro
+    - ./video_recorder.py:/app/video_recorder.py:ro
+    - ./web:/app/web:ro
+    - ./workers:/app/workers:ro
+    - ./weights:/app/weights
+    - ./.cache:/app/.cache
+    - ./detection:/app/detection
+    - ./config.json:/app/config.json:ro
+    # Avatar gallery: QHH SIS stores avatars as absolute host paths
+    # (/home/mq/.classroom_manager/faces/...). Mount the same path inside
+    # the container so ArcFace can build the face gallery.
+    - /home/mq/.classroom_manager/faces:/home/mq/.classroom_manager/faces:ro
+  restart: unless-stopped
+  networks:
+    - qhh-ai
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  worker:
+    <<: *app-base
+    # Không pin container_name để scale được nhiều replica.
+    # Tên worker dùng pid + hostname để mỗi container là 1 Celery node độc lập.
+    # Scale: docker compose up -d --scale worker=N
+    deploy:
+      replicas: 3
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - celery
+      - -A
+      - celery_app
+      - worker
+      - -Q
+      - clip
+      - -P
+      - solo
+      - -c
+      - "1"
+      - -n
+      - clip-worker@%h
+      - --loglevel=info
+
+  # Celery Beat — chủ động flush retry queue (event bắn snapshot bị fail) theo
+  # chu kỳ SNAPSHOT_FLUSH_INTERVAL, độc lập với việc có video mới hay không.
+  # Chỉ 1 replica để tránh nhiều beat đẩy trùng lịch.
+  beat:
+    <<: *app-base
+    container_name: qhh-ai-beat
+    command:
+      - celery
+      - -A
+      - celery_app
+      - beat
+      - --loglevel=info
+    depends_on:
+      - worker
+
+  # Scheduler production — quét recordings/{cameraId}/{YYYYMMDD}/*.mkv mỗi 10s,
+  # resolve qua TKB + camera-class rồi dispatch process_clip_task lên queue clip.
+  scheduler:
+    <<: *app-base
+    container_name: qhh-ai-scheduler
+    command: ["python", "-m", "video_scheduler"]
+    environment:
+      REDIS_HOST: ${REDIS_HOST:-192.168.6.170}
+      REDIS_PORT: ${REDIS_PORT:-6377}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-qhh_redis_change_me}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      QT_QPA_PLATFORM: offscreen
+      # Quét đúng cây thư mục recorder ghi ra.
+      VIDEO_DIR: /app/recordings
+      VIDEO_SCAN_INTERVAL_SEC: ${VIDEO_SCAN_INTERVAL_SEC:-10}
+    depends_on:
+      - worker
+
+  # Recorder production — quay RTSP các camera aiEnabled (trong tiết học) thành
+  # segment 10s, ghi vào recordings/{cameraId}/{YYYYMMDD}/ cho scheduler nhặt.
+  recorder:
+    <<: *app-base
+    container_name: qhh-ai-recorder
+    command: ["python", "-m", "video_recorder"]
+    environment:
+      REDIS_HOST: ${REDIS_HOST:-192.168.6.170}
+      REDIS_PORT: ${REDIS_PORT:-6377}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-qhh_redis_change_me}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      QT_QPA_PLATFORM: offscreen
+      QHH_RECORD_DIR: /app/recordings
+      QHH_WEB_RECORD_DURATION_SEC: ${QHH_WEB_RECORD_DURATION_SEC:-10}
+      # 1 = chỉ quay trong tiết Active (TKB); 0 = quay 24/7 mọi camera aiEnabled.
+      RECORDER_IN_PERIOD_ONLY: ${RECORDER_IN_PERIOD_ONLY:-0}
+      RECORDER_DISCOVER_INTERVAL_SEC: ${RECORDER_DISCOVER_INTERVAL_SEC:-30}
+    depends_on:
+      - worker
+
+  web:
+    <<: *app-base
+    container_name: qhh-ai-web
+    command: ["python", "web_server.py"]
+    ports:
+      - "8090:8090"
+
+  api:
+    <<: *app-base
+    container_name: qhh-ai-api
+    command:
+      - bash
+      - -c
+      - |
+        pip install --quiet "fastapi>=0.111" "uvicorn[standard]>=0.29" "httpx>=0.27" "python-multipart>=0.0.9" &&
+        exec uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: ${REDIS_HOST:-192.168.6.170}
+      REDIS_PORT: ${REDIS_PORT:-6377}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-qhh_redis_change_me}
+      # api có block environment riêng → YAML merge <<: ghi đè anchor, phải lặp lại TZ.
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      QT_QPA_PLATFORM: offscreen
+      WEB_SERVER_BASE: http://web:8090
+      # Scheduler chỉ tự chạy khi web test record tắt.
+      QHH_WEB_RECORD_ON_AI: ${QHH_WEB_RECORD_ON_AI:-true}
+      # Scheduler scan recordings folder structure: {cameraId}/{YYYYMMDD}/*.mkv
+      VIDEO_DIR: /app/recordings
+    volumes:
+      - ./videos:/app/videos
+      - ./recordings:/app/recordings:ro
+      - ./weights:/app/weights
+      - ./.cache:/app/.cache
+      - ./detection:/app/detection
+      - ./config.json:/app/config.json:ro
+      # API cần ghi file ảnh khi đăng ký face → mount RW
+      - /home/mq/.classroom_manager/faces:/home/mq/.classroom_manager/faces
+      - ./fastapi_app.py:/app/fastapi_app.py:ro
+      - ./video_scheduler.py:/app/video_scheduler.py:ro
+      - ./clip_queue.py:/app/clip_queue.py:ro
+      - ./tasks.py:/app/tasks.py:ro
+      - ./clip_inference.py:/app/clip_inference.py:ro
+      - ./web:/app/web:ro
+      - ./db:/app/db:ro
+      - ./workers:/app/workers:ro
+    depends_on:
+      - web
+
+  onnxruntime:
+    image: kibaes/onnxruntime-server:1.27.0-linux-cuda13
+    container_name: qhh-ai-onnxruntime
+    volumes:
+      - ./weights:/models:ro
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+    networks:
+      - qhh-ai
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  qhh-ai:
+    driver: bridge
