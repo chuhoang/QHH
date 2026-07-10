@@ -11,6 +11,8 @@ weights/
 *.mov
 *.webm
 recordings/
+videos/
+result_test/
 
 # ── Image ───────────────────────────────────────────────────────────
 *.jpg
@@ -19,6 +21,10 @@ recordings/
 *.webp
 *.bmp
 detection/
+
+# ── Data ────────────────────────────────────────────────────────────
+*.csv
+*.jsonl
 
 # ── JSON (giữ lại config.json của app) ──────────────────────────────
 *.json
@@ -32,3 +38,18 @@ logs/
 __pycache__/
 *.pyc
 .cache/
+.tmp*
+.pytest_cache/
+.mypy_cache/
+torchinductor_*/
+
+# ── Env / IDE ───────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+
+# ── Archive (file đã loại khỏi luồng chạy) ──────────────────────────
+_archive/

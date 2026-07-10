@@ -24,12 +24,23 @@ x-app: &app-base
     TZ: ${TZ:-Asia/Ho_Chi_Minh}
     # Qt headless so PySide6 imports cleanly inside containers.
     QT_QPA_PLATFORM: offscreen
+    # ── Detect ở 1280 (full-frame) ─────────────────────────────────────
+    # Resize frame 1 LẦN về cạnh dài 1280 ngay sau decode (clip_inference),
+    # rồi YOLO + RetinaFace cùng chạy network input 1280 trên frame đó.
+    # RetinaFace cần bản ONNX dynamic-shape (model gốc fix cứng 640).
+    CLIP_FRAME_MAX_SIDE: ${CLIP_FRAME_MAX_SIDE:-1280}
+    # Xử lý 1 frame mỗi N (bù compute 1280). Ngưỡng theo thời gian
+    # (DISTRACT_ALERT_FRAMES, SORT_MAX_AGE) tự scale theo stride trong code.
+    CLIP_FRAME_STRIDE: ${CLIP_FRAME_STRIDE:-3}
+    RETINAFACE_IMAGE_SIZE: ${RETINAFACE_IMAGE_SIZE:-1280}
+    RETINAFACE_MODEL_PATH: ${RETINAFACE_MODEL_PATH:-/app/weights/detectFace_dyn.onnx}
+    YOLO_IMGSZ: ${YOLO_IMGSZ:-1280}
     # Test toàn ảnh: bỏ qua region khoanh, zone = toàn frame.
     CLIP_ZONE_FULL_FRAME: "1"
     # Centerpoint chỉ cần center bbox trong zone (tắt overlap check).
     CENTERPOINT_MIN_OVERLAP: "0"
     # Ingest API — bắn classroom-snapshot sau mỗi video xử lý xong.
-    SNAPSHOT_INGEST_URL: ${SNAPSHOT_INGEST_URL:-http://192.168.6.145:8088/api/events}
+    SNAPSHOT_INGEST_URL: ${SNAPSHOT_INGEST_URL:-https://qhh.test.mqsolutions.vn/api/attendance/ai/classroom-snapshot}
     SNAPSHOT_INGEST_API_KEY: ${SNAPSHOT_INGEST_API_KEY:-qhh_ai_ingest_change_me}
     # Base URL để client fetch ảnh snapshot: http://{host}:8000/snapshots
     DISTRACTION_SNAPSHOT_BASE_URL: ${DISTRACTION_SNAPSHOT_BASE_URL:-http://192.168.6.170:8000/snapshots}

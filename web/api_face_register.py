@@ -42,12 +42,32 @@ def _ensure_str(v) -> str:
 _STUDENT_CODE_TO_ID = "qhh:face:student-code:{code}"  # studentCode → studentId
 
 
+def _find_existing_user_id(r, student_code: str) -> str:
+    """Tìm user qhh-server đã ghi sẵn có username/studentCode = student_code.
+
+    Server ghi hồ sơ user vào `qhh:user:{id}` (id, username, fullName, ...)
+    TRƯỚC khi AI đăng ký face. Nếu tìm thấy → reuse id đó để embedding gắn
+    vào đúng hồ sơ gốc, không sinh UUID song song.
+    """
+    for k in r.scan_iter(match="qhh:user:*", count=500):
+        key = _ensure_str(k)
+        username = _ensure_str(r.hget(key, "username"))
+        code = _ensure_str(r.hget(key, "studentCode"))
+        if student_code in (username, code):
+            sid = _ensure_str(r.hget(key, "id")) or key.rsplit(":", 1)[-1]
+            return sid
+    return ""
+
+
 def get_or_create_student_id(student_code: str) -> str:
     """Trả về studentId stable cho studentCode.
 
-    - Nếu đã có index `qhh:face:student-code:{code}` và `qhh:user:{id}` tồn tại
-      → trả về id cũ (cập nhật embedding cùng id, không tạo mới).
-    - Nếu chưa → sinh UUID v4 mới, ghi index, trả về.
+    Thứ tự resolve:
+    1. Index `qhh:face:student-code:{code}` đã có → trả id cũ (cập nhật
+       embedding cùng id, không tạo mới).
+    2. Chưa có index → quét `qhh:user:*` tìm hồ sơ server có
+       username/studentCode trùng → reuse id đó (ghi index để lần sau khỏi quét).
+    3. Không tìm thấy → sinh UUID v4 mới, ghi index, trả về.
     """
     if not student_code:
         return ""
@@ -59,6 +79,12 @@ def get_or_create_student_id(student_code: str) -> str:
         # Luôn reuse UUID cũ — kể cả khi qhh:user:{sid} mất (Redis restart).
         # Embedding sẽ được ghi lại vào đúng sid này, không tạo ID mới.
         return _ensure_str(cached)
+
+    existing = _find_existing_user_id(r, student_code)
+    if existing:
+        r.set(key, existing)
+        print(f"[face-register] studentCode={student_code} → reuse server user id={existing}", flush=True)
+        return existing
 
     import uuid
     sid = str(uuid.uuid4())

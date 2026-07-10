@@ -25,3 +25,4 @@ test_*.py
 build/
 dist/
 *.egg-info
+_archive/

@@ -323,6 +323,11 @@ class AIDetectionWorker(QThread):
             self._yolo_device = 0 if torch.cuda.is_available() else "cpu"
         except Exception:
             self._yolo_device = "cpu"
+        # Last full-frame RetinaFace detections from the current frame.  Clip
+        # inference reuses these for track fallback instead of running RetinaFace
+        # a second time on the same frame.
+        self._last_face_dets: list[dict] = []
+
         # Per-worker hysteresis state — keyed by student_id when known, else by desk-slot.
         # FPS instrumentation for YOLO / RetinaFace / ArcFace / Gaze / pipeline.
         self._fps = _FpsAggregator(FPS_LOG_PERIOD, "ai")
@@ -491,6 +496,9 @@ class AIDetectionWorker(QThread):
             yolo_results = self._yolo(
                 frame, classes=[0], verbose=False, device=self._yolo_device,
                 conf=float(os.getenv("YOLO_PERSON_CONF", "0.15")),
+                # Network input của YOLO (letterbox nội bộ ultralytics).
+                # 1280 giúp bắt người nhỏ/xa trên camera độ phân giải cao.
+                imgsz=int(os.getenv("YOLO_IMGSZ", "640")),
             )
         self._fps_yolo.tick((time.monotonic() - _yolo_t0) * 1000.0)
         person_boxes: list[tuple[int, int, int, int]] = []
@@ -1165,6 +1173,7 @@ class AIDetectionWorker(QThread):
         the YOLO person whose bbox contains its centre. Same outputs, ~20x
         faster.
         """
+        self._last_face_dets = []
         if not person_bboxes:
             return []
 
@@ -1174,6 +1183,7 @@ class AIDetectionWorker(QThread):
         _retina_t0 = time.monotonic()
         with self._INFERENCE_LOCK:
             face_dets = self._retinaface.detect_all(frame)
+        self._last_face_dets = face_dets
         self._fps_retina.tick((time.monotonic() - _retina_t0) * 1000.0)
 
         # Map each detected face to the person bbox that contains its centre.

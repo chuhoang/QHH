@@ -6,6 +6,7 @@ import json
 import os
 import random
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,7 +175,7 @@ def _build_snapshot_payload(result: dict, classroom: dict) -> dict:
             "resultImageUrls": student_imgs,
         })
 
-    # Chỉ giữ x,y,w,h trong regions — bỏ mapX/mapY/mapW/mapH.
+    # Mirror regions theo format ingest classroom-snapshot (kèm mapX/mapY/mapW/mapH).
     regions_out = []
     for reg in classroom.get("regions", []):
         regions_out.append({
@@ -184,6 +185,10 @@ def _build_snapshot_payload(result: dict, classroom: dict) -> dict:
             "y": reg.get("y"),
             "w": reg.get("w"),
             "h": reg.get("h"),
+            "mapX": reg.get("mapX"),
+            "mapY": reg.get("mapY"),
+            "mapW": reg.get("mapW"),
+            "mapH": reg.get("mapH"),
             "studentIds": reg.get("studentIds", []),
         })
 
@@ -194,6 +199,9 @@ def _build_snapshot_payload(result: dict, classroom: dict) -> dict:
         "aiEnabled": classroom.get("aiEnabled", True),
         "rtspChannel": classroom.get("rtspChannel"),
         "rtspPath": classroom.get("rtspPath", ""),
+        # Vùng tập trung gaze (normalized) — mirror lại từ config để client
+        # đối chiếu event với cấu hình đã dùng khi chấm attention.
+        "attentionRegions": classroom.get("attentionRegions"),
         "regions": regions_out,
         # Mỗi student mang resultImageUrls riêng (ảnh mất tập trung của HS đó,
         # hoặc 1 ảnh ngẫu nhiên nếu HS vắng mặt).
@@ -202,11 +210,13 @@ def _build_snapshot_payload(result: dict, classroom: dict) -> dict:
     }
 
 
-def _post_snapshot(payload: dict) -> bool:
-    """POST snapshot lên ingest API. Trả True nếu server nhận (2xx), False nếu fail.
+def _post_snapshot(payload: dict) -> tuple[bool, bool]:
+    """POST snapshot lên ingest API. Trả (ok, permanent).
 
-    KHÔNG nuốt lỗi âm thầm nữa: caller dựa vào giá trị trả về để quyết định
-    có đẩy vào retry queue và có được phép xóa video gốc hay không.
+    ok        — server nhận (2xx).
+    permanent — server TỪ CHỐI payload (4xx, vd 400 validation): retry cùng
+                payload sẽ fail mãi → caller đưa thẳng deadletter, không retry.
+    Lỗi mạng/5xx/timeout → (False, False): tạm thời, được phép retry.
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -223,11 +233,25 @@ def _post_snapshot(payload: dict) -> bool:
             ok = 200 <= int(resp.status) < 300
             print(f"[tasks] snapshot POST → {resp.status} ({'ok' if ok else 'fail'})", flush=True)
             _log_event(payload, status=int(resp.status))
-            return ok
-    except Exception as exc:  # noqa: BLE001 — fail (kể cả timeout) → caller xử lý retry
+            return ok, False
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(300).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+        permanent = 400 <= exc.code < 500
+        print(
+            f"[tasks] snapshot POST failed: HTTP {exc.code}"
+            f"{' (permanent)' if permanent else ''} {detail}",
+            flush=True,
+        )
+        _log_event(payload, status=exc.code, error=f"HTTP {exc.code}: {detail}")
+        return False, permanent
+    except Exception as exc:  # noqa: BLE001 — lỗi mạng/timeout → caller retry
         print(f"[tasks] snapshot POST failed: {exc}", flush=True)
         _log_event(payload, status=None, error=str(exc))
-        return False
+        return False, False
 
 
 def _enqueue_snapshot_retry(r, payload: dict, video_path: str, md5: str,
@@ -279,7 +303,7 @@ def _flush_snapshot_retry(r, max_items: int = SNAPSHOT_FLUSH_BATCH) -> dict:
             continue
 
         payload = item.get("payload", {})
-        ok = _post_snapshot(payload)
+        ok, permanent = _post_snapshot(payload)
         if ok:
             sent += 1
             # Gửi được rồi MỚI xóa video gốc đã giữ lại.
@@ -294,7 +318,17 @@ def _flush_snapshot_retry(r, max_items: int = SNAPSHOT_FLUSH_BATCH) -> dict:
 
         item["attempts"] = int(item.get("attempts", 0)) + 1
         item["lastFailedAt"] = _now_iso()
-        item["lastError"] = "post failed"
+        item["lastError"] = "post failed (permanent 4xx)" if permanent else "post failed"
+        if permanent:
+            # Server từ chối payload (4xx) — retry vô ích, đưa thẳng deadletter.
+            r.rpush(SNAPSHOT_DEADLETTER_KEY, json.dumps(item, ensure_ascii=False))
+            dead += 1
+            print(
+                f"[tasks] snapshot → deadletter (permanent 4xx, "
+                f"attempts={item['attempts']}) md5={item.get('md5')}",
+                flush=True,
+            )
+            continue
         age = _item_age_sec(item)
         if age >= SNAPSHOT_MAX_AGE_SEC:
             # Quá hạn sống → bỏ qua (deadletter), không retry nữa.
@@ -380,14 +414,25 @@ def process_clip_task(self, video_path: str, camera_id: str, class_id: str):
         raw_cfg = r.get(f"qhh:attendance:camera-class:{camera_id}:{class_id}")
         classroom = json.loads(raw_cfg) if raw_cfg else {}
         snapshot = _build_snapshot_payload(result, classroom)
-        posted = _post_snapshot(snapshot)
+        posted, permanent = _post_snapshot(snapshot)
 
         if posted:
             # Gửi được → xóa video gốc (result + index + status=SUCCESS đã ghi xong).
             _delete_processed_video(r, video_path, md5, camera_id, class_id)
+        elif permanent:
+            # Server từ chối payload (4xx, vd roster rỗng) — retry cùng payload
+            # sẽ fail mãi → ghi thẳng deadletter, không làm phình retry queue.
+            item = {
+                "payload": snapshot, "videoPath": video_path, "md5": md5,
+                "cameraId": camera_id, "classId": class_id, "attempts": 1,
+                "firstFailedAt": _now_iso(), "lastFailedAt": _now_iso(),
+                "lastError": "initial post rejected (4xx)",
+            }
+            r.rpush(SNAPSHOT_DEADLETTER_KEY, json.dumps(item, ensure_ascii=False))
+            print(f"[tasks] snapshot → deadletter (permanent 4xx) md5={md5}", flush=True)
         else:
-            # Gửi FAIL → KHÔNG xóa video. Đưa event vào Redis retry queue, giữ
-            # nguyên video để chỉ xóa khi retry queue gửi lại thành công.
+            # Lỗi tạm thời (mạng/5xx) → KHÔNG xóa video. Đưa event vào retry
+            # queue, giữ nguyên video để chỉ xóa khi gửi lại thành công.
             _enqueue_snapshot_retry(
                 r, snapshot, video_path, md5, camera_id, class_id,
                 last_error="initial post failed",

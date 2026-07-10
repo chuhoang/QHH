@@ -152,6 +152,7 @@ def _build_context(
         # Gaze wedge (plan_distraction): 2 điểm mép bảng + 2 điểm giới hạn
         # cao độ, server bổ sung khi cấu hình TKB. None nếu chưa cấu hình
         # → pipeline tự fallback chế độ ngưỡng yaw/pitch cũ.
+        "attentionRegions": config.get("attentionRegions"),
         "boardLine": config.get("boardLine"),
         "pitchLimit": config.get("pitchLimit"),
         "aiEnabled": _truthy(config.get("aiEnabled", False)),

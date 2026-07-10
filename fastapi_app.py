@@ -159,7 +159,7 @@ app = FastAPI(
 )
 
 # Serve distraction snapshot images: GET /snapshots/{camId}/{videoStem}/{frame}.jpg
-_SNAP_DIR = Path(os.getenv("QHH_DISTRACTION_SNAP_DIR", "/app/detection/distraction"))
+_SNAP_DIR = FPath(os.getenv("QHH_DISTRACTION_SNAP_DIR", "/app/detection/distraction"))
 _SNAP_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/snapshots", StaticFiles(directory=str(_SNAP_DIR)), name="snapshots")
 

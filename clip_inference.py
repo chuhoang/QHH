@@ -244,22 +244,54 @@ _LOOKUP_MARGIN_RAD = math.radians(float(os.getenv("LOOKUP_MARGIN_DEG", "5")))
 # Distraction chỉ "tính" khi kéo dài đủ N frame LIÊN TỤC (theo student).
 _DISTRACT_ALERT_FRAMES = int(os.getenv("DISTRACT_ALERT_FRAMES", "100"))
 
+# Resize frame MỘT LẦN ngay sau decode (giữ tỉ lệ, không pad) về cạnh dài
+# tối đa này rồi mới cho qua YOLO + RetinaFace — tránh mỗi model tự resize
+# từ frame gốc. 0 = tắt (dùng frame gốc). Kết hợp RETINAFACE_IMAGE_SIZE và
+# YOLO_IMGSZ cùng giá trị để 2 model chạy đúng độ phân giải này.
+_FRAME_MAX_SIDE = int(os.getenv("CLIP_FRAME_MAX_SIDE", "0"))
+
+# Frame skipping: chỉ xử lý 1 frame mỗi N frame decode (1 = xử lý hết).
+# Các ngưỡng THEO THỜI GIAN tự scale theo stride để giữ ngữ nghĩa giây:
+#   - DISTRACT_ALERT_FRAMES (100 @25fps = 4s) → 100/stride frame xử lý
+#   - SORT max_age (60 = 2.4s) → 60/stride
+# Ngưỡng dạng TỈ LỆ (presence_ratio, assigned_seat_ratio, distracted_ratio)
+# không cần đổi — tử và mẫu đều đếm trên frame đã xử lý.
+_FRAME_STRIDE = max(1, int(os.getenv("CLIP_FRAME_STRIDE", "1")))
+
 
 def _board_from_config(classroom: dict) -> dict | None:
-    """Đọc boardLine (bắt buộc) + pitchLimit (tùy chọn) từ camera-class config.
+    """Đọc vùng tập trung từ camera-class config (server ghi khi cấu hình TKB).
 
-    Schema server bổ sung khi query thời khóa biểu:
+    Schema chuẩn (normalized 0..1):
+        "attentionRegions": {"L": 0.30, "R": 0.20, "TL": 0.15, "TR": 0.10}
+      L/R  = cao độ y của 2 đầu ĐƯỜNG BẢNG trên cạnh trái/phải frame.
+      TL/TR = cao độ y của 2 đầu đường GIỚI HẠN CAO ĐỘ (tùy chọn).
+      Convert sang pixel khi biết kích thước frame (_board_pixels).
+
+    Schema cũ (pixel tuyệt đối) vẫn hỗ trợ:
         "boardLine":  {"L": [x, y], "R": [x, y]}
         "pitchLimit": {"TL": [x, y], "TR": [x, y]}
-    KHÔNG tự khởi tạo giá trị mặc định — thiếu boardLine → trả None và
-    pipeline giữ nguyên chế độ ngưỡng yaw/pitch cũ (backward compatible).
+
+    KHÔNG tự khởi tạo mặc định — thiếu cả hai → None, pipeline giữ nguyên
+    chế độ ngưỡng yaw/pitch cũ (backward compatible).
     """
+    ar = classroom.get("attentionRegions") or {}
+    if ar.get("L") is not None and ar.get("R") is not None:
+        return {
+            "norm": True,
+            "L_y": float(ar["L"]),
+            "R_y": float(ar["R"]),
+            "TL_y": float(ar["TL"]) if ar.get("TL") is not None else None,
+            "TR_y": float(ar["TR"]) if ar.get("TR") is not None else None,
+        }
+
     bl = classroom.get("boardLine") or {}
     L = bl.get("L")
     R = bl.get("R")
     if not L or not R or len(L) < 2 or len(R) < 2:
         return None
     board = {
+        "norm": False,
         "L": (float(L[0]), float(L[1])),
         "R": (float(R[0]), float(R[1])),
         "t_y": None,
@@ -270,6 +302,25 @@ def _board_from_config(classroom: dict) -> dict | None:
     if TL and TR and len(TL) >= 2 and len(TR) >= 2:
         board["t_y"] = (float(TL[1]) + float(TR[1])) / 2.0
     return board
+
+
+def _board_pixels(board: dict, frame_w: int, frame_h: int) -> dict:
+    """Convert board normalized (attentionRegions) → tọa độ pixel.
+
+    L đặt trên cạnh trái (x=0), R trên cạnh phải (x=W-1); TL/TR trung bình
+    thành 1 đường ngang t_y như schema pixel. Board đã pixel → trả nguyên.
+    """
+    if not board.get("norm"):
+        return board
+    out = {
+        "norm": False,
+        "L": (0.0, board["L_y"] * frame_h),
+        "R": (float(frame_w - 1), board["R_y"] * frame_h),
+        "t_y": None,
+    }
+    if board.get("TL_y") is not None and board.get("TR_y") is not None:
+        out["t_y"] = ((board["TL_y"] + board["TR_y"]) / 2.0) * frame_h
+    return out
 
 
 def _gaze_attention_state(O: tuple[float, float], yaw_rad: float,
@@ -403,6 +454,9 @@ def _get_engine():
             self._gallery_embeddings = _np.empty(
                 (0, ArcFaceExtractor.EMBEDDING_DIM), dtype=_np.float32
             )
+            # Reused by track fallback after _detect() runs RetinaFace once on
+            # the full frame.  Avoids duplicate RetinaFace on the same frame.
+            self._last_face_dets = []
             self._ground_transform = None
             self._zone_ground_polys = {}
             self._calibration_dirty = True
@@ -532,8 +586,13 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
     # ── Gaze mode: wedge nếu config Redis có boardLine, ngược lại legacy ──
     board = _board_from_config(classroom)
     if board is not None:
-        print(f"[clip] gaze mode: WEDGE boardLine L={board['L']} R={board['R']} "
-              f"pitch_limit_y={board['t_y']}", flush=True)
+        if board.get("norm"):
+            print(f"[clip] gaze mode: WEDGE attentionRegions "
+                  f"L={board['L_y']} R={board['R_y']} "
+                  f"TL={board['TL_y']} TR={board['TR_y']} (normalized)", flush=True)
+        else:
+            print(f"[clip] gaze mode: WEDGE boardLine L={board['L']} R={board['R']} "
+                  f"pitch_limit_y={board['t_y']}", flush=True)
     else:
         print(f"[clip] gaze mode: legacy threshold yaw>{yaw_th} pitch>{pitch_th} "
               f"(no boardLine in camera-class config)", flush=True)
@@ -542,6 +601,12 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
     # mới coi là mất tập trung thật (attention=false) + chụp ảnh.
     distract_run: dict[str, int] = {}
     sustained_alerted: set[str] = set()
+    # Ngưỡng chuỗi liên tục theo frame XỬ LÝ — scale theo stride để vẫn ~4s thật.
+    alert_frames = max(1, round(_DISTRACT_ALERT_FRAMES / _FRAME_STRIDE))
+    if _FRAME_STRIDE > 1:
+        print(f"[clip] frame stride={_FRAME_STRIDE}: distraction alert sau "
+              f"{alert_frames} frame xử lý (≈{_DISTRACT_ALERT_FRAMES} frame gốc)",
+              flush=True)
 
     def _result_distracted(r: dict, frame_h: int) -> bool | None:
         """True/False = distracted/focused frame này; None = không có gaze."""
@@ -570,8 +635,9 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
     if _sort_dir not in _sys.path:
         _sys.path.insert(0, _sort_dir)
     from sort import Sort  # type: ignore
+    # max_age tính theo frame XỬ LÝ — chia stride để giữ nguyên ~2.4s thật.
     tracker = Sort(
-        max_age=int(os.getenv("SORT_MAX_AGE", "60")),
+        max_age=max(1, int(os.getenv("SORT_MAX_AGE", "60")) // _FRAME_STRIDE),
         min_hits=int(os.getenv("SORT_MIN_HITS", "3")),
         iou_threshold=float(os.getenv("SORT_IOU_THRESHOLD", "0.3")),
     )
@@ -582,8 +648,11 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
     if not cap.isOpened():
         raise RuntimeError(f"cv2.VideoCapture cannot open {video_path}")
     fps_decl = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # fps hiệu dụng sau frame skipping — dùng cho duration + annotated video.
+    fps_eff = float(fps_decl) / _FRAME_STRIDE
     unmatched_faces = 0
-    frames = 0
+    frames = 0          # số frame ĐÃ XỬ LÝ (mọi ratio/chuỗi đếm theo số này)
+    frames_decoded = 0  # số frame decode từ video (gồm cả frame bị skip)
     t0 = time.time()
 
     # Annotated video writer (lazy — open on first frame so we know W,H,fps).
@@ -608,13 +677,40 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
     distracted_captured: set[str] = set()
     # Danh sách ảnh đã lưu: [{path, url, frame, studentIds, ...}]
     distraction_snapshots: list[dict] = []
+    # Frame dự phòng đã vẽ box HS — dùng khi clip không có alert nào.
+    fallback_img = None
+    fallback_frame_idx = 0
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+            frames_decoded += 1
+            # ── Frame skipping: chỉ xử lý 1 frame mỗi _FRAME_STRIDE ──
+            if _FRAME_STRIDE > 1 and (frames_decoded - 1) % _FRAME_STRIDE:
+                continue
             frames += 1
+            # ── Resize 1 lần về cạnh dài _FRAME_MAX_SIDE (giữ tỉ lệ) ──
+            # Mọi thứ downstream (YOLO/RetinaFace/regions/attentionRegions/
+            # snapshot) đều làm việc trên frame này — tọa độ tự nhất quán.
+            if _FRAME_MAX_SIDE > 0:
+                _fh0, _fw0 = frame.shape[:2]
+                _m = max(_fh0, _fw0)
+                if _m > _FRAME_MAX_SIDE:
+                    _s = _FRAME_MAX_SIDE / float(_m)
+                    frame = cv2.resize(
+                        frame, (int(_fw0 * _s), int(_fh0 * _s)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    if frames == 1:
+                        print(f"[clip] frame downscale 1x: {_fw0}x{_fh0} → "
+                              f"{frame.shape[1]}x{frame.shape[0]}", flush=True)
+            # attentionRegions normalized → convert pixel 1 lần khi biết frame size.
+            if board is not None and board.get("norm"):
+                board = _board_pixels(board, frame.shape[1], frame.shape[0])
+                print(f"[clip] attentionRegions → pixels: L={board['L']} "
+                      f"R={board['R']} t_y={board['t_y']}", flush=True)
             annotated, aggregated = engine._detect(
                 frame, seats, students_by_id, engine._seat_lookup,
                 engine._face_gallery, cal_dirty=(frames == 1),
@@ -642,7 +738,7 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
                     h, w = annotated.shape[:2]
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
-                        str(annotated_path), fourcc, float(fps_decl), (w, h),
+                        str(annotated_path), fourcc, fps_eff, (w, h),
                     )
                 video_writer.write(annotated)
             # ── SORT update: gom person_bbox của mọi result trong frame ──
@@ -715,21 +811,25 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
                         track_to_student[tid] = cand
                         print(f"[clip] track T{tid} → {cand[:8]} via low-threshold (sim={score:.3f})", flush=True)
 
-            # ── Fallback: ArcFace trên full frame để gán track chưa biết tên ──
-            # camera_worker chạy RetinaFace trên YOLO crop nhỏ → dễ fail khi
-            # người ngồi xa. Chạy thêm RetinaFace trên full frame, map face
-            # center vào SORT track, gán track_to_student một lần là đủ.
+            # ── Fallback: ArcFace trên full-frame face_dets đã có ───────────
+            # camera_worker._detect() đã chạy RetinaFace full-frame 1 lần/frame
+            # và cache ở engine._last_face_dets. Reuse để tránh duplicate
+            # RetinaFace detect_all(frame) chỉ để học track chưa biết tên.
             unassigned_tids = [int(tk[4]) for tk in tracks if int(tk[4]) not in track_to_student]
             if unassigned_tids and engine._gallery_embeddings.shape[0] > 0:
                 try:
-                    face_dets = engine._retinaface.detect_all(frame)
+                    face_dets = getattr(engine, "_last_face_dets", []) or []
                     if face_dets:
-                        aligned = [d["aligned_face"] for d in face_dets if d.get("aligned_face") is not None]
-                        if aligned:
-                            embeds = engine._arcface.extract(aligned)
+                        det_aligned = [
+                            (d, d.get("aligned_face"))
+                            for d in face_dets if d.get("aligned_face") is not None
+                        ]
+                        if det_aligned:
+                            dets_for_embed, aligned = zip(*det_aligned)
+                            embeds = engine._arcface.extract(list(aligned))
                             gallery = engine._face_gallery
                             gal_embs = engine._gallery_embeddings  # (N, 512)
-                            for det, emb in zip(face_dets, embeds):
+                            for det, emb in zip(dets_for_embed, embeds):
                                 if emb is None:
                                     continue
                                 # tanh-calibrated similarity vs gallery
@@ -742,23 +842,25 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
                                 if best_sim < _TRACK_ASSIGN_THRESHOLD:
                                     continue
                                 best_sid = str(gallery[best_idx].get("student_id") or gallery[best_idx].get("studentId") or "")
-                                # Map face center → SORT track bbox
-                                fb = det.get("face_box")  # (x, y, w, h)
-                                if fb is None:
-                                    continue
-                                fx, fy, fw, fh = fb
-                                cx = fx + fw // 2
-                                cy = fy + fh // 2
+                                fb = det.get("face_box")
+                                if fb is not None:
+                                    fx, fy, fw, fh = fb
+                                    cx = fx + fw // 2
+                                    cy = fy + fh // 2
+                                else:
+                                    fx1, fy1, fx2, fy2 = det.get("loc", (0, 0, 0, 0))
+                                    cx = int((float(fx1) + float(fx2)) / 2.0)
+                                    cy = int((float(fy1) + float(fy2)) / 2.0)
                                 for tk in tracks:
                                     tx1, ty1, tx2, ty2, ttid = int(tk[0]), int(tk[1]), int(tk[2]), int(tk[3]), int(tk[4])
                                     if ttid in track_to_student:
                                         continue
                                     if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
                                         track_to_student[ttid] = best_sid
-                                        print(f"[clip] full-frame ArcFace: track T{ttid} → {best_sid[:8]} (sim={best_sim:.3f})", flush=True)
+                                        print(f"[clip] reused RetinaFace ArcFace: track T{ttid} → {best_sid[:8]} (sim={best_sim:.3f})", flush=True)
                                         break
                 except Exception as _e:
-                    print(f"[clip] full-frame ArcFace error: {_e}", flush=True)
+                    print(f"[clip] reused RetinaFace ArcFace error: {_e}", flush=True)
 
             # ── Tập student_ids "có mặt" trong frame (face thấy + track suy ra) ──
             present_sids: set[str] = set()
@@ -865,13 +967,13 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
             # Chỉ báo distraction + chụp ảnh khi chuỗi đạt ngưỡng liên tục.
             new_offenders = {
                 sid for sid in distracted_now
-                if distract_run[sid] >= _DISTRACT_ALERT_FRAMES
+                if distract_run[sid] >= alert_frames
             } - distracted_captured
             if new_offenders:
                 sustained_alerted |= new_offenders
                 for _sid in sorted(new_offenders):
                     print(f"[clip] DISTRACTION ALERT: {_sid[:8]} distracted "
-                          f">={_DISTRACT_ALERT_FRAMES} frames lien tuc "
+                          f">={alert_frames} processed frames lien tuc "
                           f"(frame {frames})", flush=True)
             if new_offenders:
                 snap_dir.mkdir(parents=True, exist_ok=True)
@@ -889,25 +991,39 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
                     "allDistractedIds": sorted(distracted_now),
                 })
                 distracted_captured |= new_offenders
+
+            # ── Fallback candidate: giữ 1 frame đã vẽ ĐỦ box (person/track/
+            # face + tên HS) để dùng làm "classroom frame" khi clip không có
+            # alert nào. Cập nhật định kỳ để lấy frame về cuối clip — lúc
+            # track_to_student đã học được nhiều tên nhất.
+            if frames % 30 == 0 and tracks is not None and len(tracks) > 0:
+                fallback_img = _draw_snap_overlay(
+                    frame, results, tracks, track_to_student, students_by_id)
+                fallback_frame_idx = frames
     finally:
         cap.release()
         if video_writer is not None:
             video_writer.release()
 
-    # Nếu không có snapshot nào (không detect face / không ai mất tập trung),
-    # lưu 1 frame giữa clip làm bằng chứng "classroom frame" để absent student
-    # vẫn có ảnh trong resultImageUrls.
+    # Nếu không có snapshot nào (không ai bị alert), lưu 1 frame "classroom
+    # frame" để absent student vẫn có ảnh trong resultImageUrls.
+    # Ưu tiên fallback_img đã vẽ box HS trong vòng xử lý; chỉ khi cả clip
+    # không có track nào mới đọc lại frame trần từ video.
     if not distraction_snapshots and frames > 0:
-        _cap2 = cv2.VideoCapture(video_path)
-        _mid = max(0, frames // 2)
-        _cap2.set(cv2.CAP_PROP_POS_FRAMES, _mid)
-        _ok, _fr = _cap2.read()
-        _cap2.release()
-        if _ok and _fr is not None:
+        _fr_ann = fallback_img
+        _mid = fallback_frame_idx if fallback_img is not None else max(0, frames // 2)
+        if _fr_ann is None:
+            _cap2 = cv2.VideoCapture(video_path)
+            _mid = max(0, frames // 2)
+            _cap2.set(cv2.CAP_PROP_POS_FRAMES, _mid)
+            _ok, _fr = _cap2.read()
+            _cap2.release()
+            if _ok and _fr is not None:
+                _fr_ann = _draw_snap_overlay(_fr, [], [], {}, students_by_id)
+        if _fr_ann is not None:
             snap_dir.mkdir(parents=True, exist_ok=True)
             _fname = f"frame_{_mid:06d}.jpg"
             _fpath = snap_dir / _fname
-            _fr_ann = _draw_snap_overlay(_fr, [], [], {}, students_by_id)
             cv2.imwrite(str(_fpath), _fr_ann, [cv2.IMWRITE_JPEG_QUALITY, 85])
             _rel = f"{cam_id}/{video_stem}/{_fname}"
             _url = f"{snap_base_url}/{_rel}" if snap_base_url else _rel
@@ -927,7 +1043,9 @@ def run_clip(video_path: str, cam_id: str, cls_id: str) -> dict:
         agg=agg,
         region_meta=region_meta,
         frames=frames,
-        fps_decl=float(fps_decl),
+        # fps hiệu dụng → clipDurationSec = frames_xử_lý / fps_eff ≈ thời
+        # lượng thật của clip, bất kể stride.
+        fps_decl=fps_eff,
         unmatched_faces=unmatched_faces,
         processing_ms=int((time.time() - t0) * 1000),
         video_path=video_path,
